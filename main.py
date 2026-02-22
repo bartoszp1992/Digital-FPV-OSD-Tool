@@ -62,27 +62,7 @@ try:
 except ImportError:
     PIL_OK = False
 
-# Suppress console window on Windows for ALL subprocess calls.
-# Use STARTUPINFO (more reliable than creationflags alone).
-def _hidden_popen(*args, **kwargs):
-    """subprocess.Popen wrapper that never shows a console window on Windows."""
-    if sys.platform == "win32":
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-        kwargs.setdefault("startupinfo", si)
-        kwargs.setdefault("creationflags", 0x08000000)  # CREATE_NO_WINDOW
-    return subprocess.Popen(*args, **kwargs)
-
-def _hidden_run(*args, **kwargs):
-    """subprocess.run wrapper that never shows a console window on Windows."""
-    if sys.platform == "win32":
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-        kwargs.setdefault("startupinfo", si)
-        kwargs.setdefault("creationflags", 0x08000000)  # CREATE_NO_WINDOW
-    return subprocess.run(*args, **kwargs)
+from subprocess_utils import _hidden_popen, _hidden_run
 
 
 # ─── Theme system ─────────────────────────────────────────────────────────────
@@ -958,6 +938,7 @@ class MainWindow(QMainWindow):
         self._play_timer.setInterval(100)   # tick every 100ms → ~10fps preview steps
         self._play_timer.timeout.connect(self._play_tick)
         self._playing      = False
+        self._dividers:    list = []
 
         self.setWindowTitle(f"VueOSD v{VERSION} — Digital FPV OSD Tool")
         # App icon — resolved relative to this script so it works from any CWD
@@ -975,7 +956,33 @@ class MainWindow(QMainWindow):
         cw.setLayout(root)
         self.setCentralWidget(cw)
 
-        # ── LEFT PANEL (scrollable) ───────────────────────────────────────────
+        left_scroll = self._build_left_panel()
+
+        centre = self._build_centre_panel()
+
+        right = self._build_right_panel()
+
+        # ── Assemble root layout ──────────────────────────────────────────────
+        root.addWidget(left_scroll)
+        root.addWidget(centre, 1)
+        root.addWidget(right)
+
+        # Vertical dividers
+        for w in (left_scroll, centre):
+            div = QFrame()
+            div.setFrameShape(QFrame.Shape.VLine)
+            self._dividers.append(div)
+            div.setStyleSheet(f"color:{_T()['border']};")
+            div.setFixedWidth(1)
+            root.insertWidget(root.indexOf(w) + 1, div)
+
+        # Collect buttons and labels for theme reapply
+        # (theme uses findChildren — no explicit list needed)
+
+        QTimer.singleShot(200, lambda: self._on_fw_changed("Betaflight"))
+
+    def _build_left_panel(self) -> "QScrollArea":
+        """Build and return the left scrollable panel."""
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1167,8 +1174,10 @@ class MainWindow(QMainWindow):
         ll.addStretch()
         left_scroll.setWidget(left_inner)
         self._left_scroll = left_scroll   # saved for theme reapply
+        return left_scroll
 
-        # ── CENTRE: preview + below-video controls ─────────────────────────────
+    def _build_centre_panel(self) -> QWidget:
+        """Build and return the centre panel (preview + controls)."""
         centre = QWidget()
         cl = QVBoxLayout(centre)
         cl.setContentsMargins(10, 16, 10, 12)
@@ -1352,8 +1361,10 @@ class MainWindow(QMainWindow):
 
         below.addWidget(cards_widget, 3)
         cl.addLayout(below)
+        return centre
 
-        # ── RIGHT PANEL ───────────────────────────────────────────────────────
+    def _build_right_panel(self) -> QWidget:
+        """Build and return the right panel (encoding + output)."""
         right = QWidget()
         right.setMinimumWidth(260)
         right.setMaximumWidth(360)
@@ -1547,28 +1558,8 @@ class MainWindow(QMainWindow):
         self._refresh_ffmpeg_status()
         rl.addWidget(self.ffmpeg_lbl)
 
-
         rl.addStretch()
-
-        # ── Assemble root layout ──────────────────────────────────────────────
-        root.addWidget(left_scroll)
-        root.addWidget(centre, 1)
-        root.addWidget(right)
-
-        # Vertical dividers
-        for w in (left_scroll, centre):
-            div = QFrame()
-            div.setFrameShape(QFrame.Shape.VLine)
-            self._dividers = getattr(self, '_dividers', [])
-            self._dividers.append(div)
-            div.setStyleSheet(f"color:{_T()['border']};")
-            div.setFixedWidth(1)
-            root.insertWidget(root.indexOf(w) + 1, div)
-
-        # Collect buttons and labels for theme reapply
-        # (theme uses findChildren — no explicit list needed)
-
-        QTimer.singleShot(200, lambda: self._on_fw_changed("Betaflight"))
+        return right
 
     def _on_codec_changed(self):
         self._update_size_hint()
@@ -1697,18 +1688,21 @@ class MainWindow(QMainWindow):
 
     # ── Theme ─────────────────────────────────────────────────────────────────
 
+    def _refresh_theme(self):
+        """Rebuild all stylesheet strings and repaint the live UI."""
+        _build_styles()
+        self._apply_theme()
+
     def _on_scale_changed(self, idx: int):
         global _UI_SCALE
         _UI_SCALE = [1.0, 1.25, 1.5, 1.75][idx]
-        _build_styles()
-        self._apply_theme()
+        self._refresh_theme()
         _save_settings()
 
     def _toggle_theme(self):
         global _DARK_THEME
         _DARK_THEME = not _DARK_THEME
-        _build_styles()
-        self._apply_theme()
+        self._refresh_theme()
 
     def _open_theme_editor(self):
         """Open (or raise) the palette editor dialog."""
@@ -1724,8 +1718,7 @@ class MainWindow(QMainWindow):
     def _on_theme_applied(self):
         """Called when user clicks Apply in the editor — reload and repaint."""
         _theme_mod.load()          # reload saved JSON into _dark / _light dicts
-        _build_styles()            # rebuild all Qt stylesheet strings
-        self._apply_theme()        # repaint live UI
+        self._refresh_theme()      # rebuild stylesheets and repaint live UI
         if self._theme_editor_dlg:
             self._theme_editor_dlg.reload_from_theme()   # sync editor panels
 
@@ -1770,7 +1763,7 @@ class MainWindow(QMainWindow):
             cb.setStyleSheet(COMBO_STYLE)
         for ck in self.findChildren(QCheckBox):
             ck.setStyleSheet(f"color:{t['text']};font-size:{_fs(11)}px;")
-        for div in getattr(self, '_dividers', []):
+        for div in self._dividers:
             div.setStyleSheet(f"color:{t['border']};")
         for w in self.findChildren(LabeledSlider):
             w.refresh_theme()

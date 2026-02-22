@@ -42,25 +42,12 @@ try:
 except ImportError:
     PIL_OK = False
 
-# Suppress console window on Windows for ALL subprocess calls.
-# Use STARTUPINFO (more reliable than creationflags alone).
-def _hidden_popen(*args, **kwargs):
-    if sys.platform == "win32":
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-        kwargs.setdefault("startupinfo", si)
-        kwargs.setdefault("creationflags", 0x08000000)
-    return subprocess.Popen(*args, **kwargs)
-
-def _hidden_run(*args, **kwargs):
-    if sys.platform == "win32":
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-        kwargs.setdefault("startupinfo", si)
-        kwargs.setdefault("creationflags", 0x08000000)
-    return subprocess.run(*args, **kwargs)
+from pathlib import Path
+from subprocess_utils import _hidden_popen, _hidden_run
+from osd_renderer import OsdRenderer, OsdRenderConfig, _draw_srt_bar
+from osd_parser   import parse_osd
+from srt_parser   import parse_srt
+from font_loader  import load_font
 
 
 @dataclass
@@ -246,7 +233,8 @@ def find_ffmpeg() -> Optional[str]:
     return None
 
 
-def get_video_info(video_path: str) -> dict:
+def _find_ffprobe() -> Optional[str]:
+    """Return ffprobe path from PATH or alongside ffmpeg, or None if not found."""
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         ff = find_ffmpeg()
@@ -254,6 +242,11 @@ def get_video_info(video_path: str) -> dict:
             candidate = ff.replace("ffmpeg", "ffprobe")
             if os.path.exists(candidate):
                 ffprobe = candidate
+    return ffprobe
+
+
+def get_video_info(video_path: str) -> dict:
+    ffprobe = _find_ffprobe()
     if not ffprobe:
         return {"error": "ffprobe not found"}
     cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
@@ -284,13 +277,7 @@ def get_frame_pts(video_path: str, trim_start: float = 0.0) -> list:
     Reads only frame metadata — runs at ~5,000–20,000 fps (< 2 s for a 1 h video).
     Returns an empty list on any error; caller must fall back to i/fps in that case.
     """
-    ffprobe = shutil.which("ffprobe")
-    if not ffprobe:
-        ff = find_ffmpeg()
-        if ff:
-            candidate = ff.replace("ffmpeg", "ffprobe")
-            if os.path.exists(candidate):
-                ffprobe = candidate
+    ffprobe = _find_ffprobe()
     if not ffprobe:
         return []
     cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -312,6 +299,11 @@ def get_frame_pts(video_path: str, trim_start: float = 0.0) -> list:
 
 
 _STDERR_CAP = 32 * 1024   # keep last 32 KB of ffmpeg stderr
+
+# OSD updates at ~10fps; video runs at 60fps so most consecutive frames share the
+# same OSD state.  32 entries catches all hot OSD/SRT combinations without
+# accumulating GB of RAM on long videos.
+_CACHE_MAX = 32
 
 def _drain(pipe, store: list):
     """Drain a pipe to a list[0] string, capped to avoid unbounded RAM use."""
@@ -340,6 +332,78 @@ def _read_exactly(pipe, n: int) -> Optional[bytes]:
     return bytes(buf)
 
 
+# ── Encoder quality helpers ───────────────────────────────────────────────────
+
+def _build_quality_args(
+    encoder: str, config: ProcessingConfig, use_vaapi: bool
+) -> "tuple[list, list, list]":
+    """Return (quality_args, preset_args, pix_fmt_args) for the given encoder.
+
+    pix_fmt_args: for hardware encoders the filter_complex format= node already
+    delivers the correct pixel format — passing -pix_fmt after -c:v confuses
+    NVENC on Linux ("Operation not permitted") and AMF on Windows.  Only VAAPI
+    needs special handling (hwupload path).  CPU encoders need -pix_fmt yuv420p.
+    """
+    use_nvenc = "nvenc" in encoder
+    use_amf   = "amf"   in encoder
+
+    # ── Software (CPU) encoders ───────────────────────────────────────────────
+    if encoder in ("libx264", "libx265"):
+        if config.bitrate_mbps:
+            quality_args = ["-b:v",     f"{config.bitrate_mbps}M",
+                            "-maxrate", f"{config.bitrate_mbps * 1.5:.1f}M",
+                            "-bufsize", f"{config.bitrate_mbps * 2:.1f}M"]
+        else:
+            quality_args = ["-crf", str(config.crf)]
+        return quality_args, ["-preset", config.preset], ["-pix_fmt", "yuv420p"]
+
+    # ── Hardware (GPU) encoders ───────────────────────────────────────────────
+    if use_nvenc:
+        if config.bitrate_mbps:
+            quality_args = ["-rc:v", "vbr",
+                            "-b:v",     f"{config.bitrate_mbps}M",
+                            "-maxrate", f"{config.bitrate_mbps * 1.5:.1f}M",
+                            "-bufsize", f"{config.bitrate_mbps * 2:.1f}M"]
+        else:
+            nvenc_cq = min(51, config.crf + 9)
+            quality_args = ["-rc:v", "vbr", "-cq", str(nvenc_cq),
+                            "-maxrate", "50M", "-bufsize", "100M"]
+    elif "vaapi" in encoder:
+        if config.bitrate_mbps:
+            quality_args = ["-rc_mode", "VBR", "-b:v", f"{config.bitrate_mbps}M"]
+        else:
+            quality_args = ["-rc_mode", "VBR", "-qp", str(config.crf)]
+    elif use_amf:
+        if config.bitrate_mbps:
+            quality_args = ["-rc", "vbr_latency", "-b:v", f"{config.bitrate_mbps}M"]
+        else:
+            quality_args = ["-rc", "cqp",
+                            "-qp_i", str(config.crf), "-qp_p", str(config.crf)]
+    elif "qsv" in encoder:
+        if config.bitrate_mbps:
+            quality_args = ["-b:v", f"{config.bitrate_mbps}M"]
+        else:
+            quality_args = ["-global_quality", str(config.crf)]
+    else:
+        # Generic hardware fallback (videotoolbox, v4l2m2m, etc.)
+        if config.bitrate_mbps:
+            quality_args = ["-b:v", f"{config.bitrate_mbps}M"]
+        else:
+            quality_args = ["-cq", str(config.crf)]
+
+    preset_args = (["-preset", "p6"]     if use_nvenc        else
+                   ["-preset", "medium"] if "qsv" in encoder else [])
+
+    if use_vaapi:
+        pix_fmt_args = ["-pix_fmt", "nv12"]
+    elif use_nvenc or use_amf:
+        pix_fmt_args = []
+    else:
+        pix_fmt_args = ["-pix_fmt", "yuv420p"]
+
+    return quality_args, preset_args, pix_fmt_args
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def process_video(
@@ -351,14 +415,6 @@ def process_video(
         raise FileNotFoundError("FFmpeg not found!\nGet from https://www.gyan.dev/ffmpeg/builds/")
     if not PIL_OK:
         raise RuntimeError("Pillow is required: pip install Pillow")
-
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from osd_parser   import parse_osd
-    from srt_parser   import parse_srt
-    from font_loader  import load_font
-    from osd_renderer import OsdRenderer, OsdRenderConfig
-    from pathlib      import Path
 
     # ── Load data ─────────────────────────────────────────────────────────────
     osd_data = srt_data = font = None
@@ -395,78 +451,18 @@ def process_video(
     duration = info["duration"]
 
     # ── Resolve encoder ────────────────────────────────────────────────────────
-    hw_info  = detect_hw_encoder(ffmpeg) if config.use_hw else None
+    hw_info   = detect_hw_encoder(ffmpeg) if config.use_hw else None
     use_vaapi = hw_info and hw_info.get("vaapi", False)
 
     if hw_info and config.use_hw:
-        codec_map   = {"libx264": hw_info["h264"], "libx265": hw_info["h265"]}
-        encoder     = codec_map.get(config.codec, hw_info["h264"])
-        enc_label   = f"{hw_info['name']} ({encoder})"
-        # GPU rate control — prefer bitrate (VBR) when config.bitrate_mbps is set
-        if "nvenc" in encoder:
-            if config.bitrate_mbps:
-                quality_args = [
-                    "-rc:v", "vbr",
-                    "-b:v", f"{config.bitrate_mbps}M",
-                    "-maxrate", f"{config.bitrate_mbps * 1.5:.1f}M",
-                    "-bufsize", f"{config.bitrate_mbps * 2:.1f}M",
-                ]
-            else:
-                nvenc_cq = min(51, config.crf + 9)
-                quality_args = ["-rc:v", "vbr", "-cq", str(nvenc_cq),
-                                "-maxrate", "50M", "-bufsize", "100M"]
-        elif "vaapi" in encoder:
-            if config.bitrate_mbps:
-                quality_args = ["-rc_mode", "VBR", "-b:v", f"{config.bitrate_mbps}M"]
-            else:
-                quality_args = ["-rc_mode", "VBR", "-qp", str(config.crf)]
-        elif "amf" in encoder:
-            if config.bitrate_mbps:
-                quality_args = ["-rc", "vbr_latency", "-b:v", f"{config.bitrate_mbps}M"]
-            else:
-                quality_args = ["-rc", "cqp",
-                                "-qp_i", str(config.crf),
-                                "-qp_p", str(config.crf)]
-        elif "qsv" in encoder:
-            if config.bitrate_mbps:
-                quality_args = ["-b:v", f"{config.bitrate_mbps}M"]
-            else:
-                quality_args = ["-global_quality", str(config.crf)]
-        else:
-            if config.bitrate_mbps:
-                quality_args = ["-b:v", f"{config.bitrate_mbps}M"]
-            else:
-                quality_args = ["-cq", str(config.crf)]
-        preset_args = ["-preset", "p6"] if "nvenc" in encoder else \
-                      (["-preset", "medium"] if "qsv" in encoder else [])
-        # pix_fmt_args: for hardware encoders the filter_complex format= node
-        # already delivers the correct pixel format to the encoder — passing
-        # -pix_fmt after -c:v confuses NVENC on Linux ("Operation not permitted")
-        # and AMF on Windows.  Only VAAPI needs special handling (hwupload path).
-        # CPU encoders still need an explicit -pix_fmt yuv420p.
-        use_nvenc = "nvenc" in encoder
-        use_amf   = "amf"   in encoder
-        if use_vaapi:
-            pix_fmt_args = ["-pix_fmt", "nv12"]
-        elif use_nvenc or use_amf:
-            # NVENC and AMF: format is already set by filter_complex; no extra flag.
-            # Passing -pix_fmt after -c:v h264_nvenc causes "Operation not permitted"
-            # on Linux and AMF init failure on Windows.
-            pix_fmt_args = []
-        else:
-            # QSV and any other HW encoder: explicit yuv420p is safe and expected
-            pix_fmt_args = ["-pix_fmt", "yuv420p"]
+        codec_map = {"libx264": hw_info["h264"], "libx265": hw_info["h265"]}
+        encoder   = codec_map.get(config.codec, hw_info["h264"])
+        enc_label = f"{hw_info['name']} ({encoder})"
     else:
-        encoder      = config.codec
-        enc_label    = f"CPU ({encoder})"
-        if config.bitrate_mbps:
-            quality_args = ["-b:v", f"{config.bitrate_mbps}M",
-                            "-maxrate", f"{config.bitrate_mbps * 1.5:.1f}M",
-                            "-bufsize", f"{config.bitrate_mbps * 2:.1f}M"]
-        else:
-            quality_args = ["-crf", str(config.crf)]
-        preset_args  = ["-preset", config.preset]
-        pix_fmt_args = ["-pix_fmt", "yuv420p"]
+        encoder   = config.codec
+        enc_label = f"CPU ({encoder})"
+
+    quality_args, preset_args, pix_fmt_args = _build_quality_args(encoder, config, use_vaapi)
 
     # ── Choose pipeline ────────────────────────────────────────────────────────
     # Fast path: OSD overlay pipe — Python handles ONLY the OSD frames,
@@ -515,10 +511,6 @@ def _overlay_pipeline(
     FFmpeg overlays the OSD stream onto the source video and encodes.
     Python never reads or writes a single raw video frame.
     """
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from osd_renderer import OsdRenderer, OsdRenderConfig
-
     total_frames = max(1, int(duration * fps))
     render_cfg = OsdRenderConfig(
         offset_x    = config.offset_x,
@@ -634,11 +626,7 @@ def _overlay_pipeline(
     # OSD frames (which are the vast majority) cost only a dict lookup + write.
     # This guarantees frame-perfect sync: pipe frame i always matches video frame i.
 
-    # Frame cache: (osd_index, srt_text) → composited bytes
-    # Capped at 128 entries — OSD updates at ~10fps but video runs at 60fps,
-    # so consecutive repeats are caught with a small window. Prevents GB of RAM
-    # on long videos with many unique OSD/SRT combinations.
-    _CACHE_MAX   = 32
+    # Frame cache: (osd_index, srt_text) → composited bytes  (see module-level _CACHE_MAX)
     _frame_cache: dict = {}
     report_every = max(1, n_out_frames // 50)
 
@@ -726,11 +714,6 @@ def _srt_only_pipeline(
     progress_callback,
 ):
     """SRT text bar rendered in Python, piped through the old frame-by-frame path."""
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from osd_renderer import _draw_srt_bar
-    from PIL import Image
-
     total_frames = max(1, int(duration * fps))
     frame_bytes  = width * height * 4
 
