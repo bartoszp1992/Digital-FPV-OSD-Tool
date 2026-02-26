@@ -45,6 +45,8 @@ The application is a pipeline: parse → render → pipe → encode.
 ```
 main.py (PyQt6 GUI)
     │
+    ├── player.py          — Video player widgets (VideoCanvas, Timeline, TransportBar, PlayerController)
+    │
     ├── osd_parser.py      — Binary .osd format parser (timestamp-indexed, bisect lookup)
     ├── p1_osd_parser.py   — BetaFPV P1 MP4 embedded OSD extraction
     ├── srt_parser.py      — .srt subtitle telemetry parser (speed, alt, sats, signal)
@@ -75,6 +77,6 @@ main.py (PyQt6 GUI)
 
 **Firmware auto-detection** (`main.py` `_load_osd()`): Reads the 4-byte FC type tag from the OSD header (`BTFL` → Betaflight, `INAV` → INAV, `ARDU` → ArduPilot) and calls `_on_fw_changed()` directly. Unknown tags fall back to Betaflight. There is no firmware selector in the UI.
 
-**Preview placeholder** (`PreviewPanel`, `main.py`): When no video is loaded, draws a Quick Start panel using `QPainter` on a `QPixmap` sized to the actual widget dimensions. Includes a pixel-art heart and donation link at the bottom (hidden when the widget is too short). Click zones are stored in `self._donate_rects` and hit-tested in `mousePressEvent`/`mouseMoveEvent`.
+**Video player** (`player.py`): Contains `VideoCanvas` (frame display with Quick Start placeholder), `Timeline` (scrub + trim handles + cache dots), `TransportBar` (play/pause, step, shuttle controls), `PlayerController` (FFmpeg pipe management, frame cache, playback state machine), and `PlayerPanel` (container). Keyboard shortcuts (Space, Left/Right, J/K/L, I/O, Home/End) are handled in `MainWindow.keyPressEvent()` and delegated to `PlayerController`.
 
 **Windows taskbar integration** (`main.py`): Sets `AppUserModelID` via ctypes for proper icon display.

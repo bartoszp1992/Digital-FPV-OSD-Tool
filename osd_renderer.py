@@ -141,9 +141,10 @@ def _draw_srt_bar(img: "Image.Image", text: str, opacity: float = 0.6,
     pad = 6;  margin = 10
     x   = (img.width  - tw) // 2
     y   = img.height - th - margin
+    alpha_byte = int(opacity * 255)
     draw.rounded_rectangle([x-pad, y-pad, x+tw+pad, y+th+pad],
-                            radius=4, fill=(0, 0, 0, int(opacity * 255)))
-    draw.text((x, y), text, font=fnt, fill=(255, 255, 255, 255))
+                            radius=4, fill=(0, 0, 0, alpha_byte))
+    draw.text((x, y), text, font=fnt, fill=(255, 255, 255, alpha_byte))
     img.alpha_composite(overlay)
 
 
@@ -238,7 +239,7 @@ class OsdRenderer:
             y    = self.h - th - margin
             draw.rounded_rectangle([x-pad, y-pad, x+tw+pad, y+th+pad],
                                     radius=4, fill=(0, 0, 0, opacity_byte))
-            draw.text((x,   y  ), text, font=fnt, fill=(255, 255, 255, 255))
+            draw.text((x,   y  ), text, font=fnt, fill=(255, 255, 255, opacity_byte))
 
             arr = np.array(bar, dtype=np.uint8)
             nz  = np.where(arr[:, :, 3] > 0)

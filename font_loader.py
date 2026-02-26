@@ -180,6 +180,28 @@ def fonts_by_firmware(firmware: str) -> Dict[str, Path]:
     }
 
 
+def import_font(src_path: str, firmware: str, name: str) -> Optional[Path]:
+    """Copy a font PNG into fonts/<prefix><name>/ with proper naming.
+
+    Returns the created folder Path on success, None on failure.
+    """
+    import shutil
+
+    prefixes = FIRMWARE_PREFIXES.get(firmware, [])
+    prefix = prefixes[0] if prefixes else ""
+    folder_name = f"{prefix}{name}"
+    dest_dir = _FONTS_DIR / folder_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pick the standard HD filename for this firmware
+    fw_key = firmware.lower()[:4]
+    hd_name = f"font_{fw_key}_hd.png"
+    dest_file = dest_dir / hd_name
+
+    shutil.copy2(src_path, dest_file)
+    return dest_dir
+
+
 def load_font(folder: Path, prefer_hd: bool = True) -> Optional[OsdFont]:
     """Load HD or SD PNG from a font folder."""
     if not folder.is_dir():

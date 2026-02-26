@@ -5,7 +5,7 @@ VueOSD — Digital FPV OSD Tool
 Parse and overlay MSP-OSD data onto FPV DVR video footage.
 """
 
-import sys, os, math, threading, subprocess, tempfile, json, random
+import sys, os, math, threading, subprocess, json, time
 
 # ── Windows: set AppUserModelID so taskbar shows our icon, not Python's ───────
 if sys.platform == "win32":
@@ -39,23 +39,6 @@ from video_processor import ProcessingConfig, process_video, get_video_info, fin
 from splash_screen   import SplashScreen
 
 
-_DONATE_URL = "https://buymeacoffee.com/failsavefpv"
-
-_DONATE_NOTES = [
-    "Runs on coffee & failed maiden flights.",
-    "Every donation funds one more prop replacement.",
-    "This tool is free. My props are not.",
-    "If this saved your footage, maybe save my bank account.",
-    "Claude wrote the code. I flew into a tree to test it.",
-    "100% AI-assisted. 0% AI-responsible for the bugs.",
-    "Built with Claude. Crashed with Betaflight.",
-    "Blackbox says: prop strike at 0:42. Donate anyway.",
-    "The AI did the coding. I did the crashing.",
-    "Claude suggested a paywall. I said no. For now.",
-]
-_DONATE_NOTE = random.choice(_DONATE_NOTES)
-
-
 try:
     from PIL import Image as PILImage
     PIL_OK = True
@@ -73,7 +56,7 @@ _DARK_THEME = True   # module-level flag; toggled by the theme button
 
 # ─── Version & UI scale ───────────────────────────────────────────────────────
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 _UI_SCALE = 1.0
 _SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
@@ -208,6 +191,9 @@ APP_STYLE = GROUP_STYLE = PATH_EMPTY = PATH_FILLED = ""
 BTN_SEC = BTN_PRIMARY = BTN_PLAY = BTN_STOP = BTN_DANGER = ""
 COMBO_STYLE = SLIDER_STYLE = PROG_STYLE = ""
 _build_styles()
+
+# Frame-slider resolution: 10 000 steps gives ~0.18 s precision on a 30-min clip.
+_SL_MAX = 10_000
 
 
 # ─── Icon helpers ─────────────────────────────────────────────────────────────
@@ -558,344 +544,13 @@ class RenderBar(QWidget):
         p.end()
 
 
-class CacheBar(QWidget):
-    """Thin progress bar shown below the frame slider while preview frames are being cached."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(18)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._total   = 0   # total frames to cache
-        self._cached  = 0   # frames cached so far
-        self._visible = False
-        self.setVisible(False)
-
-    def start(self, total: int):
-        self._total   = max(1, total)
-        self._cached  = 0
-        self._visible = True
-        self.setVisible(True)
-        self.update()
-
-    def update_count(self, cached: int):
-        self._cached = cached
-        self.update()
-        if self._cached >= self._total:
-            self.finish()
-
-    def finish(self):
-        self._visible = False
-        self.setVisible(False)
-
-    def paintEvent(self, _e):
-        t = _T()
-        w, h = self.width(), self.height()
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = 3
-        # Background track
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(t['surface']))
-        p.drawRoundedRect(0, 0, w, h, r, r)
-        # Fill
-        if self._total > 0:
-            fw = int(w * min(self._cached, self._total) / self._total)
-            if fw > 0:
-                from PyQt6.QtGui import QLinearGradient
-                grad = QLinearGradient(0, 0, fw, 0)
-                grad.setColorAt(0.0, QColor(t['accent']))
-                grad.setColorAt(1.0, QColor(t['accent2']))
-                p.setBrush(grad)
-                p.drawRoundedRect(0, 0, fw, h, r, r)
-        # Label
-        p.setPen(QColor(t['text']))
-        p.setFont(QFont("Segoe UI", 8))
-        label = f"Caching preview…  {self._cached}/{self._total}"
-        p.drawText(0, 0, w, h, Qt.AlignmentFlag.AlignCenter, label)
-        p.end()
+## CacheBar — removed (now in player.py Timeline cached-frame dots)
 
 
-class RangeSelector(QWidget):
-    """Dual-handle in/out trim slider drawn with QPainter."""
-    rangeChanged = pyqtSignal(float, float)   # in_pct, out_pct (0.0–1.0)
-
-    HANDLE_W = 10
-    TRACK_H  = 6
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(32)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._in  = 0.0
-        self._out = 1.0
-        self._drag = None   # "in" | "out" | None
-        self.setMouseTracking(True)
-
-    # ── public api ────────────────────────────────────────────────────────────
-    @property
-    def in_pct(self):  return self._in
-    @property
-    def out_pct(self): return self._out
-
-    def set_in(self, v):
-        self._in = max(0.0, min(v, self._out - 0.01))
-        self.update(); self.rangeChanged.emit(self._in, self._out)
-
-    def set_out(self, v):
-        self._out = max(self._in + 0.01, min(v, 1.0))
-        self.update(); self.rangeChanged.emit(self._in, self._out)
-
-    def reset(self):
-        self._in, self._out = 0.0, 1.0
-        self.update(); self.rangeChanged.emit(0.0, 1.0)
-
-    # ── geometry helpers ──────────────────────────────────────────────────────
-    def _track_rect(self):
-        hw = self.HANDLE_W
-        return (hw, (self.height() - self.TRACK_H) // 2,
-                self.width() - hw * 2, self.TRACK_H)
-
-    def _handle_x(self, pct):
-        tx, _, tw, _ = self._track_rect()
-        return int(tx + pct * tw)
-
-    def _pct_from_x(self, x):
-        tx, _, tw, _ = self._track_rect()
-        return max(0.0, min(1.0, (x - tx) / tw))
-
-    def _handle_rect(self, pct):
-        hw = self.HANDLE_W; hh = self.height()
-        cx = self._handle_x(pct)
-        return (cx - hw // 2, 4, hw, hh - 8)
-
-    # ── painting ─────────────────────────────────────────────────────────────
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        tx, ty, tw, th = self._track_rect()
-        t = _T()
-
-        # Full track
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(t['surface']))
-        p.drawRoundedRect(tx, ty, tw, th, 3, 3)
-
-        # Active region
-        x1 = self._handle_x(self._in)
-        x2 = self._handle_x(self._out)
-        p.setBrush(QColor(t['accent']))
-        p.drawRect(x1, ty, x2 - x1, th)
-
-        # Handles
-        hw = self.HANDLE_W
-        for pct, label in ((self._in, "I"), (self._out, "O")):
-            hx, hy, hwidth, hheight = self._handle_rect(pct)
-            p.setBrush(QColor(t['text']))
-            p.drawRoundedRect(hx, hy, hwidth, hheight, 3, 3)
-            p.setPen(QColor(t['bg']))
-            p.setFont(QFont("Segoe UI", 6, QFont.Weight.Bold))
-            p.drawText(hx, hy, hwidth, hheight,
-                       Qt.AlignmentFlag.AlignCenter, label)
-            p.setPen(Qt.PenStyle.NoPen)
-
-        p.end()
-
-    # ── mouse interaction ────────────────────────────────────────────────────
-    def _nearest_handle(self, x):
-        xi = self._handle_x(self._in)
-        xo = self._handle_x(self._out)
-        return "in" if abs(x - xi) <= abs(x - xo) else "out"
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._drag = self._nearest_handle(int(e.position().x()))
-
-    def mouseMoveEvent(self, e):
-        if self._drag:
-            pct = self._pct_from_x(int(e.position().x()))
-            if self._drag == "in":
-                self.set_in(pct)
-            else:
-                self.set_out(pct)
-        else:
-            # Cursor hint
-            x = int(e.position().x())
-            xi = self._handle_x(self._in)
-            xo = self._handle_x(self._out)
-            near = min(abs(x - xi), abs(x - xo))
-            self.setCursor(Qt.CursorShape.SizeHorCursor if near < 14
-                           else Qt.CursorShape.ArrowCursor)
-
-    def mouseReleaseEvent(self, e):
-        self._drag = None
+## RangeSelector — removed (now Timeline in player.py)
 
 
-class PreviewPanel(QLabel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(320, 180)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setScaledContents(False)
-        t = _T()
-        self.setStyleSheet(
-            f"background:{t['bg2']};border:1px solid {t['border']};border-radius:8px;")
-        self._pil_img = None          # always keep full-res PIL source
-        self._donate_rects = []       # clickable zones while placeholder is shown
-        self._placeholder()
-
-    def _placeholder(self):
-        self._pil_img = None
-        self.setMouseTracking(True)
-        self._redraw_placeholder()
-
-    def mouseMoveEvent(self, event):
-        if self._pil_img is None:
-            pos = event.position().toPoint()
-            in_zone = any(r.contains(pos) for r in self._donate_rects)
-            self.setCursor(Qt.CursorShape.PointingHandCursor if in_zone
-                           else Qt.CursorShape.ArrowCursor)
-        super().mouseMoveEvent(event)
-
-    def mousePressEvent(self, event):
-        if self._pil_img is None:
-            pos = event.position().toPoint()
-            if any(r.contains(pos) for r in self._donate_rects):
-                QDesktopServices.openUrl(QUrl(_DONATE_URL))
-        super().mousePressEvent(event)
-
-    def _redraw_placeholder(self):
-        w = max(self.width(), 1)
-        h = max(self.height(), 1)
-        pix = QPixmap(w, h)
-        t = _T()
-        pix.fill(QColor(t["bg2"]))
-        p = QPainter(pix)
-
-        cx = w // 2
-        lw = min(w - 40, 500)
-        lx = cx - lw // 2
-
-        # ── Measure content blocks ─────────────────────────────────────────
-        TITLE_H   = 28
-        SEP_ABOVE = 5    # title-bottom → separator
-        STEP_BELOW= 13   # separator → first step
-        STEP_H    = 22
-        STEP_PITCH= 24
-        N_STEPS   = 4
-        qs_h = TITLE_H + SEP_ABOVE + 1 + STEP_BELOW + (N_STEPS - 1) * STEP_PITCH + STEP_H
-
-        px = 3
-        heart_w = 13 * px   # 39
-        heart_h = 11 * px   # 33
-        don_h   = heart_h + 4 + 16 + 8 + 16   # 77
-
-        PAD      = 12
-        GAP      = 24   # space between QS block and donation block
-        show_don = h >= PAD + qs_h + GAP + don_h + PAD
-
-        total_h = qs_h + (GAP + don_h if show_don else 0)
-        top     = max(PAD, (h - total_h) // 2)
-
-        # ── Quick Start ────────────────────────────────────────────────────
-        title_y = top
-        p.setPen(QPen(QColor(t["subtext"])))
-        p.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        p.drawText(QRect(lx, title_y, lw, TITLE_H),
-                   Qt.AlignmentFlag.AlignCenter, "Quick Start")
-
-        sep_y = title_y + TITLE_H + SEP_ABOVE
-        p.setPen(QPen(QColor(t["border2"])))
-        p.drawLine(lx, sep_y, lx + lw, sep_y)
-
-        step0_y = sep_y + 1 + STEP_BELOW
-        steps = [
-            "①  Drop a video, .osd or .srt onto the drop zone — companions auto-load",
-            "②  Pick a font style in the left panel",
-            "③  Adjust position, opacity and scale; configure the SRT bar",
-            "④  Set the output file path, then click  Render",
-        ]
-        p.setPen(QPen(QColor(t["muted"])))
-        p.setFont(QFont("Segoe UI", 10))
-        for i, line in enumerate(steps):
-            p.drawText(QRect(lx, step0_y + i * STEP_PITCH, lw, STEP_H),
-                       Qt.AlignmentFlag.AlignLeft, line)
-
-        # ── Donation section (hidden when widget is too short) ─────────────
-        if show_don:
-            HEART = [
-                "00KKK00KKK000",   # row  0 – tops of two bumps
-                "0KRRRK0KRRRK0",   # row  1 – bump fills
-                "KRWWRRRRRRRRK",   # row  2 – bumps merge; 2×2 white highlight begins
-                "KRWWRRRRRRRRK",   # row  3 – white highlight row 2
-                "KRRRRRRRRRRRK",   # row  4 – full-width body
-                "0KRRRRRRRRRK0",   # row  5 – staircase step 1
-                "00KRRRRRRRK00",   # row  6 – staircase step 2
-                "000KRRRRRK000",   # row  7 – staircase step 3
-                "0000KRRRK0000",   # row  8 – staircase step 4
-                "00000KRK00000",   # row  9 – staircase step 5
-                "000000K000000",   # row 10 – single-pixel tip
-            ]
-            heart_x = cx - heart_w // 2
-            heart_y = top + qs_h + GAP
-            _hcol = {"K": QColor("#000000"), "R": QColor("#e60020"), "W": QColor("#ffffff")}
-            p.setPen(Qt.PenStyle.NoPen)
-            for ri, row in enumerate(HEART):
-                for ci, ch in enumerate(row):
-                    col = _hcol.get(ch)
-                    if col:
-                        p.setBrush(col)
-                        p.drawRect(heart_x + ci * px, heart_y + ri * px, px, px)
-
-            p.setPen(QPen(QColor(t["muted"])))
-            p.setFont(QFont("Segoe UI", 9))
-            p.drawText(QRect(lx, heart_y + heart_h + 4, lw, 16),
-                       Qt.AlignmentFlag.AlignCenter, _DONATE_NOTE)
-
-            p.setPen(QPen(QColor(t["accent"])))
-            p.setFont(QFont("Segoe UI", 9))
-            p.drawText(QRect(lx, heart_y + heart_h + 24, lw, 16),
-                       Qt.AlignmentFlag.AlignCenter, "buymeacoffee.com/failsavefpv  \u2197")
-
-            self._donate_rects = [
-                QRect(heart_x, heart_y, heart_w, heart_h),
-                QRect(lx, heart_y + heart_h + 24, lw, 16),
-            ]
-        else:
-            self._donate_rects = []
-
-        p.end()
-        super().setPixmap(pix)
-
-    def show_frame(self, img):
-        if not PIL_OK:
-            return
-        self.setMouseTracking(False)
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-        self._donate_rects = []
-        self._pil_img = img.convert("RGBA")
-        self._repaint()
-
-    def _repaint(self):
-        """Render PIL image scaled to fit current widget, maintaining aspect ratio."""
-        if self._pil_img is None:
-            return
-        w = max(self.width(),  320)
-        h = max(self.height(), 180)
-        # Scale down only (thumbnail won't upscale) — use LANCZOS for quality
-        tmp = self._pil_img.copy()
-        tmp.thumbnail((w, h), PILImage.LANCZOS)
-        data = tmp.tobytes("raw", "RGBA")
-        qi   = QImage(data, tmp.width, tmp.height, QImage.Format.Format_RGBA8888)
-        # Centre inside the widget — QLabel AlignCenter handles this automatically
-        super().setPixmap(QPixmap.fromImage(qi))
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        if self._pil_img is not None:
-            self._repaint()
-        else:
-            self._redraw_placeholder()
+## PreviewPanel — removed (now VideoCanvas in player.py)
 
 
 def _sep():
@@ -918,26 +573,9 @@ class MainWindow(QMainWindow):
         self.video_frame = None
         self.video_fps:  float = 60.0
         self.video_dur:  float = 0.0
-        self.cached_frames: dict = {}
         self.worker      = None
         self._font_db:   dict = {}
         self.source_mbps: float = 0.0   # source video bitrate, set after loading
-        self._extract_proc = None        # current ffmpeg frame-extract process
-        self._prefetch_stop = False      # signal to stop background prefetch
-        self._scrub_timer  = QTimer()    # debounce frame-slider scrubbing
-        self._scrub_timer.setSingleShot(True)
-        self._scrub_timer.setInterval(80)
-        self._scrub_timer.timeout.connect(self._do_scrub)
-        self._pending_pct  = 0
-        self._preview_timer = QTimer()   # debounce position/scale/opacity sliders
-        self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(60)
-        self._preview_timer.timeout.connect(self._refresh_preview)
-        # Playback state
-        self._play_timer   = QTimer()
-        self._play_timer.setInterval(100)   # tick every 100ms → ~10fps preview steps
-        self._play_timer.timeout.connect(self._play_tick)
-        self._playing      = False
         self._dividers:    list = []
 
         self.setWindowTitle(f"VueOSD v{VERSION} — Digital FPV OSD Tool")
@@ -1127,7 +765,7 @@ class MainWindow(QMainWindow):
         self.hd_check.setChecked(True)
         self.hd_check.setStyleSheet(f"color:{_T()['text']};font-size:11px;")
         self.hd_check.stateChanged.connect(self._reload_font)
-        self._custom_btn = QPushButton("Custom…")
+        self._custom_btn = QPushButton("+  Add Font")
         self._custom_btn.setStyleSheet(BTN_SEC)
         self._custom_btn.setFixedHeight(26)
         self._custom_btn.clicked.connect(self._custom_font)
@@ -1177,7 +815,9 @@ class MainWindow(QMainWindow):
         return left_scroll
 
     def _build_centre_panel(self) -> QWidget:
-        """Build and return the centre panel (preview + controls)."""
+        """Build and return the centre panel (player + controls)."""
+        from player import PlayerPanel
+
         centre = QWidget()
         cl = QVBoxLayout(centre)
         cl.setContentsMargins(10, 16, 10, 12)
@@ -1188,95 +828,37 @@ class MainWindow(QMainWindow):
         self._prev_lbl.setStyleSheet(f"color:{_T()['subtext']}")
         cl.addWidget(self._prev_lbl)
 
-        self.preview = PreviewPanel()
-        self._preview_panel = self.preview   # saved for theme reapply
-        cl.addWidget(self.preview, 1)
+        # ── New player panel (replaces PreviewPanel + slider + trim + transport)
+        self._player_panel = PlayerPanel(
+            theme_fn=_T,
+            icon_fn=_icon,
+            btn_play_fn=lambda: BTN_PLAY,
+            btn_sec_fn=lambda: BTN_SEC,
+            fs_fn=_fs,
+            composite_fn=self._composite,
+            osd_fn=self._render_osd_overlay,
+        )
+        cl.addWidget(self._player_panel, 1)
 
-        # Frame scrub
-        frow = QHBoxLayout()
-        fl = QLabel("Frame:")
-        fl.setStyleSheet(f"color:{_T()['subtext']};font-size:11px;")
-        fl.setFixedWidth(46)
-        self.frame_sl = QSlider(Qt.Orientation.Horizontal)
-        self.frame_sl.setRange(0, 100)
-        self.frame_sl.setValue(0)
-        self.frame_sl.setStyleSheet(SLIDER_STYLE)
-        self.frame_sl.valueChanged.connect(self._on_frame_sl)
-        self.frame_lbl = QLabel("0%")
-        self.frame_lbl.setFixedWidth(34)
-        self.frame_lbl.setStyleSheet(f"color:{_T()['text']};font-size:11px;font-weight:bold;")
-        frow.addWidget(fl)
-        frow.addWidget(self.frame_sl)
-        frow.addWidget(self.frame_lbl)
-        cl.addLayout(frow)
+        # Aliases for backward compatibility with render pipeline
+        self.trim_sel = self._player_panel.timeline
+        self.trim_in_lbl = self._player_panel.trim_in_lbl
+        self.trim_out_lbl = self._player_panel.trim_out_lbl
 
-        self.frame_info = QLabel("t = 0.0s  |  OSD —")
-        self.frame_info.setStyleSheet(f"color:{_T()['muted']};font-size:10px;")
-        cl.addWidget(self.frame_info)
+        # Wire trim signals
+        self._player_panel.timeline.trimChanged.connect(self._on_trim_changed)
+        self._player_panel.timeline.trimChanged.connect(lambda *_: self._update_size_hint())
 
-        self.cache_bar = CacheBar()
-        cl.addWidget(self.cache_bar)
+        # Wire refresh button
+        self._player_panel.transport.refreshClicked.connect(self._refresh_preview)
 
-        # ── Trim range selector ───────────────────────────────────────────────
-        trim_hdr = QHBoxLayout()
-        trim_lbl = QLabel("Trim")
-        trim_lbl.setStyleSheet(f"color:{_T()['subtext']};font-size:11px;")
-        trim_lbl.setFixedWidth(36)
-        self.trim_in_lbl  = QLabel("In: 0:00")
-        self.trim_out_lbl = QLabel("Out: —")
-        for lb in (self.trim_in_lbl, self.trim_out_lbl):
-            lb.setStyleSheet(f"color:{_T()['subtext']};font-size:10px;font-weight:bold;")
-        self._trim_rst_btn = QPushButton("✕")
-        self._trim_rst_btn.setFixedSize(20, 20)
-        self._trim_rst_btn.setStyleSheet(BTN_SEC)
-        self._trim_rst_btn.setToolTip("Reset trim to full video")
-        self._trim_rst_btn.clicked.connect(self._trim_reset)
-        trim_hdr.addWidget(trim_lbl)
-        trim_hdr.addWidget(self.trim_in_lbl)
-        trim_hdr.addStretch()
-        trim_hdr.addWidget(self.trim_out_lbl)
-        trim_hdr.addWidget(self._trim_rst_btn)
-        cl.addLayout(trim_hdr)
-
-        self.trim_sel = RangeSelector()
-        self.trim_sel.rangeChanged.connect(self._on_trim_changed)
-        self.trim_sel.rangeChanged.connect(lambda *_: self._update_size_hint())
-        cl.addWidget(self.trim_sel)
-
-        # ── Playback controls (icon buttons) ─────────────────────────────────
-        play_row = QHBoxLayout()
-        play_row.setSpacing(4)
-
-        self.restart_btn = QPushButton()
-        self.restart_btn.setIcon(_icon("rewind.png", 20))
-        self.restart_btn.setFixedSize(34, 34)
-        self.restart_btn.setStyleSheet(BTN_PLAY)
-        self.restart_btn.setToolTip("Go to start")
-        self.restart_btn.clicked.connect(self._play_restart)
-
-        self.play_btn = QPushButton()
-        self.play_btn.setIcon(_icon("play.png", 22))
-        self.play_btn.setFixedSize(44, 34)
-        self.play_btn.setStyleSheet(BTN_PLAY)
-        self.play_btn.setToolTip("Play / Pause")
-        self.play_btn.clicked.connect(self._play_toggle)
-
-        self._ref_btn = QPushButton("Refresh Preview")
-        self._ref_btn.setFixedHeight(34)
-        self._ref_btn.setMinimumWidth(120)
-        self._ref_btn.setStyleSheet(BTN_SEC)
-        self._ref_btn.clicked.connect(self._refresh_preview)
-
-        play_row.addWidget(self.restart_btn)
-        play_row.addWidget(self.play_btn)
-        play_row.addStretch()
-        play_row.addWidget(self._ref_btn)
-        cl.addLayout(play_row)
+        # Create frame_info alias for theme code
+        self.frame_info = self._player_panel.transport.info_lbl
 
         # ── Smashicons credit ─────────────────────────────────────────────────
         credit = QLabel(
             'Icons by <a href="https://www.flaticon.com/free-icons/wifi-connection" '
-            'style="color:#2a2a3a;text-decoration:none;">Smashicons – Flaticon</a>'
+            'style="color:#2a2a3a;text-decoration:none;">Smashicons \u2013 Flaticon</a>'
         )
         credit.setStyleSheet(f"color:{_T()['muted']};font-size:8px;")
         credit.setOpenExternalLinks(True)
@@ -1638,13 +1220,32 @@ class MainWindow(QMainWindow):
         self._refresh_preview()
 
     def _custom_font(self):
+        """Import a font PNG — copies it into fonts/ for permanent use."""
+        from font_loader import import_font
         p, _ = QFileDialog.getOpenFileName(self, "Select Font PNG", "", "PNG (*.png)")
-        if p:
-            self.font_obj = load_font_from_file(p)
-            if self.font_obj:
-                self.font_lbl.setText(f"✓ Custom: {os.path.basename(p)}")
-                self.font_lbl.setStyleSheet(f"color:{_T()['green']};font-size:10px;")
-                self._refresh_preview()
+        if not p:
+            return
+        # Derive a clean name from the filename
+        stem = os.path.splitext(os.path.basename(p))[0]
+        # Detect current firmware context from the selected font's prefix
+        fw = "Betaflight"
+        raw = self.style_combo.currentData() or ""
+        for fw_name, prefixes in FIRMWARE_PREFIXES.items():
+            if any(raw.upper().startswith(p.upper()) for p in prefixes):
+                fw = fw_name
+                break
+        folder = import_font(p, fw, stem)
+        if folder:
+            # Rescan fonts and select the newly imported one
+            self._on_fw_changed(fw)
+            # Find and select the new font in the combo
+            for i in range(self.style_combo.count()):
+                if self.style_combo.itemData(i) == folder.name:
+                    self.style_combo.setCurrentIndex(i)
+                    break
+            self.font_lbl.setText(f"\u2713 Imported: {stem}")
+            self.font_lbl.setStyleSheet(f"color:{_T()['green']};font-size:10px;")
+            self._refresh_preview()
 
     # ── File selection ────────────────────────────────────────────────────────
 
@@ -1778,34 +1379,22 @@ class MainWindow(QMainWindow):
             row.clr.setStyleSheet(BTN_DANGER)
         self.drop_zone.refresh_theme()
 
-        # Preview panel
-        self._preview_panel.setStyleSheet(
-            f"background:{t['bg2']};border:1px solid {t['border']};border-radius:8px;")
-        if self._preview_panel._pil_img is None:
-            self._preview_panel._redraw_placeholder()
+        # Player panel
+        self._player_panel.refresh_theme()
 
         # Buttons + icon retint
         self.render_btn.setStyleSheet(BTN_PRIMARY)
         self.stop_btn.setStyleSheet(BTN_STOP)
-        self.restart_btn.setStyleSheet(BTN_PLAY)
-        self.play_btn.setStyleSheet(BTN_PLAY)
-        # Render has a coloured (accent) bg → white icon; stop has red bg → white icon
         _render_ico_col = "#ffffff" if not _DARK_THEME else t['bg']
         self.render_btn.setIcon(_icon("render.png", 20, _render_ico_col))
         self.stop_btn.setIcon(_icon("stop.png", 20, "#ffffff"))
-        # Play/restart sit on a neutral surface → use the theme icon colour
-        self.restart_btn.setIcon(_icon("rewind.png", 20))
-        _play_name = "pause.png" if self._playing else "play.png"
-        self.play_btn.setIcon(_icon(_play_name, 22))
         # File row icons
         for row in [self.video_row, self.osd_row, self.srt_row, self.out_row]:
             row.retint()
         self._custom_btn.setStyleSheet(BTN_SEC)
-        self._ref_btn.setStyleSheet(BTN_SEC)
         self._rst_pos_btn.setStyleSheet(BTN_SEC)
         self._rst_offset_btn.setStyleSheet(BTN_SEC)
-        self._trim_rst_btn.setStyleSheet(BTN_SEC)
-        self.trim_sel.update()
+        self._player_panel.trim_rst_btn.setStyleSheet(BTN_SEC)
 
         # SpinBoxes
         _sb_style = (
@@ -1825,7 +1414,6 @@ class MainWindow(QMainWindow):
             (self.frame_info,    f"color:{t['muted']};font-size:{_fs(10)}px;"),
             (self.size_hint,     f"color:{t['muted']};font-size:{_fs(10)}px;"),
             (self.status,        f"color:{t['muted']};font-size:{_fs(10)}px;"),
-            (self.frame_lbl,     f"color:{t['text']};font-size:{_fs(11)}px;font-weight:bold;"),
             (self.osd_warn,      f"color:{t['orange']};font-size:{_fs(10)}px;"),
             (self._sync_lbl,     f"color:{t['subtext']};font-size:{_fs(11)}px;"),
 
@@ -1869,17 +1457,14 @@ class MainWindow(QMainWindow):
         if p: self.srt_row.set_path(p); self._load_srt(p)
 
     def _load_video(self, path):
-        if self._playing: self._play_pause()   # stop any running playback
+        self._player_panel.controller.stop()
         if not self.out_row.path:
             self.out_row.set_path(self._make_output_path(path))
-        self._prefetch_stop = True           # signal any running prefetch to abort
-        self.cached_frames.clear()
-        self.cache_bar.finish()
-        self._st("Reading video info…")
+        self.video_frame = None
+        self._st("Reading video info\u2026")
         self._vi = VideoInfoWorker(path)
         self._vi.result.connect(self._got_vid_info)
         self._vi.start()
-        self._extract_at_pct(0)
 
     def _got_vid_info(self, info):
         self.vid_card.clear()
@@ -1898,67 +1483,13 @@ class MainWindow(QMainWindow):
             self.vid_card.add_row("Dur",  f"{_dm}:{_ds:02d}")
             self.vid_card.add_row("Size", f"{size_mb} MB")
             self._update_size_hint()
-            # Kick off background prefetch now that we know the duration
-            QTimer.singleShot(400, self._start_prefetch)
-        # Trigger preview of frame 0 once we know the duration
-        self._refresh_preview()
+            # Load video into the player controller (triggers prefetch + frame 0 extract)
+            self._player_panel.controller.load_video(
+                self.video_row.path, self.video_dur, self.video_fps,
+                info.get("width", 0), info.get("height", 0))
         self._st("Ready")
 
-    def _start_prefetch(self):
-        """Begin background frame extraction across ~20 evenly-spaced positions."""
-        if not self.video_row.path or self.video_dur <= 0 or not find_ffmpeg():
-            return
-        # 20 evenly-spaced positions: 0, 5, 10, … 95, 100 %
-        positions = list(range(0, 101, 5))
-        # Skip positions already cached
-        to_fetch = [p for p in positions if p not in self.cached_frames]
-        if not to_fetch:
-            return
-        self._prefetch_stop = False
-        self.cache_bar.start(len(to_fetch))
-        threading.Thread(
-            target=self._prefetch_frames,
-            args=(to_fetch,),
-            daemon=True
-        ).start()
-
-    def _prefetch_frames(self, positions):
-        """Worker thread: extract one frame per position, update CacheBar."""
-        ffmpeg = find_ffmpeg()
-        if not ffmpeg: return
-        done = 0
-        for pct in positions:
-            if self._prefetch_stop:
-                break
-            if pct in self.cached_frames:
-                done += 1
-                QTimer.singleShot(0, lambda d=done: self.cache_bar.update_count(d))
-                continue
-            t = self.video_dur * pct / 100.0
-            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            tmp.close()
-            try:
-                proc = _hidden_popen(
-                    [ffmpeg, "-y", "-ss", str(t), "-i", self.video_row.path,
-                     "-vframes", "1", "-q:v", "3", tmp.name],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                proc.wait(timeout=15)
-                if (not self._prefetch_stop and proc.returncode == 0
-                        and os.path.exists(tmp.name) and PIL_OK):
-                    img = PILImage.open(tmp.name).copy().convert("RGBA")
-                    self.cached_frames[pct] = img
-                    if self.video_frame is None:
-                        self.video_frame = img
-                    done += 1
-                    _d = done
-                    QTimer.singleShot(0, lambda d=_d: self.cache_bar.update_count(d))
-            except Exception:
-                pass
-            finally:
-                try: os.unlink(tmp.name)
-                except: pass
-        QTimer.singleShot(0, self.cache_bar.finish)
+    ## _start_prefetch, _prefetch_frames — removed (now in PlayerController)
 
     def _load_osd(self, path):
         try:
@@ -2039,97 +1570,51 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._st(f"✗ SRT: {e}")
 
-    # ── Preview ───────────────────────────────────────────────────────────────
+    # ── Keyboard shortcuts ─────────────────────────────────────────────────
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        mod = event.modifiers()
+        ctrl = self._player_panel.controller
+
+        if key == Qt.Key.Key_Space:
+            ctrl.toggle_play()
+        elif key == Qt.Key.Key_Left:
+            n = 10 if mod & Qt.KeyboardModifier.ShiftModifier else 1
+            ctrl.step_backward(n)
+        elif key == Qt.Key.Key_Right:
+            n = 10 if mod & Qt.KeyboardModifier.ShiftModifier else 1
+            ctrl.step_forward(n)
+        elif key == Qt.Key.Key_J:
+            ctrl.step_backward(1)
+        elif key == Qt.Key.Key_K:
+            ctrl.shuttle_reset()
+        elif key == Qt.Key.Key_L:
+            ctrl.shuttle_faster()
+        elif key == Qt.Key.Key_Home:
+            ctrl.seek_start()
+        elif key == Qt.Key.Key_End:
+            ctrl.seek_end()
+        elif key == Qt.Key.Key_I:
+            ctrl.set_trim_in()
+        elif key == Qt.Key.Key_O:
+            ctrl.set_trim_out()
+        else:
+            super().keyPressEvent(event)
+
+    # ── Preview (delegated to PlayerController) ─────────────────────────────
 
     def _video_time_ms(self, pct):
-        """Map slider 0-100% → absolute video timestamp in ms (full video duration)."""
-        return int(self.video_dur * pct / 100.0 * 1000)
-
-    def _on_frame_sl(self, pct):
-        # Update text labels immediately for responsiveness
-        self.frame_lbl.setText(f"{pct}%")
-        t_ms = self._video_time_ms(pct) + self.osd_offset_sb.value()
-        osd_info = "—"
-        if self.osd_data:
-            fr = self.osd_data.frame_at_time(t_ms)
-            if fr: osd_info = f"pkt {fr.index}"
-        t_s = t_ms / 1000
-        m, s = divmod(int(t_s), 60)
-        self.frame_info.setText(f"t = {m}:{s:02d}  |  OSD {osd_info}")
-
-        if pct in self.cached_frames:
-            # Exact frame cached — show it
-            self._show_pct(pct)
-            return
-
-        if self._playing:
-            # During playback: re-composite the nearest cached frame rather than
-            # spawning ffmpeg (which is too slow for smooth playback)
-            nearest = min(self.cached_frames.keys(),
-                          key=lambda k: abs(k - pct)) if self.cached_frames else None
-            if nearest is not None:
-                self._show_pct(nearest)
-            return
-
-        # Stationary scrub: debounce then extract via ffmpeg
-        self._pending_pct = pct
-        self._scrub_timer.start()
-
-    def _do_scrub(self):
-        """Called ~80ms after the slider stops — extract the frame via ffmpeg."""
-        pct = self._pending_pct
-        if pct in self.cached_frames:
-            self._show_pct(pct)
-        else:
-            self._extract_at_pct(pct)
-
-    def _extract_at_pct(self, pct):
-        if not self.video_row.path or not find_ffmpeg(): return
-        ffmpeg = find_ffmpeg()
-        # Seek to the absolute timestamp (slider maps to full video)
-        t = self.video_dur * pct / 100.0 if self.video_dur > 0 else 0.0
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        tmp.close()
-        # Kill any in-flight extraction so we don't pile up ffmpeg processes
-        if self._extract_proc and self._extract_proc.poll() is None:
-            try: self._extract_proc.kill()
-            except Exception: pass
-        def _run():
-            proc = None
-            try:
-                proc = _hidden_popen(
-                    [ffmpeg, "-y", "-ss", str(t), "-i", self.video_row.path,
-                     "-vframes", "1", "-q:v", "2", tmp.name],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                self._extract_proc = proc
-                proc.wait(timeout=20)
-                if proc.returncode == 0 and os.path.exists(tmp.name) and PIL_OK:
-                    img = PILImage.open(tmp.name).copy().convert("RGBA")
-                    self.cached_frames[pct] = img
-                    if self.video_frame is None:
-                        self.video_frame = img
-                    def _on_frame_ready(p=pct):
-                        self._show_pct(p)
-                    QTimer.singleShot(0, _on_frame_ready)
-            except Exception:
-                pass
-            finally:
-                try: os.unlink(tmp.name)
-                except: pass
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _show_pct(self, pct):
-        img = self.cached_frames.get(pct)
-        if img: self.preview.show_frame(self._composite(img, pct))
+        """Map slider 0-_SL_MAX → absolute video timestamp in ms (full video duration)."""
+        return int(self.video_dur * pct / _SL_MAX * 1000)
 
     def _refresh_preview(self):
-        pct = self.frame_sl.value()
-        img = self.cached_frames.get(pct) or self.video_frame
-        if img: self.preview.show_frame(self._composite(img, pct))
+        """Refresh current frame with updated OSD composite settings."""
+        self._player_panel.controller.refresh_now()
 
     def _composite(self, img, pct):
-        t_ms     = self._video_time_ms(pct) + self.osd_offset_sb.value()
+        """Composite OSD + SRT onto a video frame at given slider position."""
+        t_ms     = self._player_panel.controller.pct_to_video_time_ms(pct) + self.osd_offset_sb.value()
         osd_frame = self.osd_data.frame_at_time(t_ms) if self.osd_data else None
         srt_text = ""
         if self.srt_data and self.srt_bar_check.isChecked():
@@ -2148,6 +1633,35 @@ class MainWindow(QMainWindow):
             return render_osd_frame(img, osd_frame, self.font_obj, cfg)
         return render_fallback(img, osd_frame, cfg)
 
+    def _render_osd_overlay(self, pct, w, h):
+        """Render OSD + SRT as transparent overlay at display size (w, h).
+
+        Used by the two-layer preview system — only re-renders the OSD,
+        skipping the expensive video frame copy and resize.
+        """
+        t_ms = self._player_panel.controller.pct_to_video_time_ms(pct) + self.osd_offset_sb.value()
+        osd_frame = self.osd_data.frame_at_time(t_ms) if self.osd_data else None
+        srt_text = ""
+        if self.srt_data and self.srt_bar_check.isChecked():
+            td = self.srt_data.get_data_at_time(t_ms)
+            if td: srt_text = td.status_line()
+        # Scale pixel offsets from video resolution to display resolution
+        ctrl = self._player_panel.controller
+        ratio = h / ctrl.video_h if ctrl.video_h > 0 else 1.0
+        cfg = OsdRenderConfig(
+            offset_x     = int(self.sl_x.value() * ratio),
+            offset_y     = int(self.sl_y.value() * ratio),
+            scale        = self.sl_scale.value() / 100.0,
+            show_srt_bar = self.srt_bar_check.isChecked(),
+            srt_text     = srt_text,
+            srt_opacity  = self.srt_opacity_sl.value() / 100.0,
+            srt_scale    = self.srt_size_sl.value() / 100.0,
+        )
+        canvas = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+        if self.font_obj and PIL_OK:
+            return render_osd_frame(canvas, osd_frame, self.font_obj, cfg)
+        return render_fallback(canvas, osd_frame, cfg)
+
     def _on_osd_offset_changed(self, value: int):
         global _OSD_OFFSET_MS
         _OSD_OFFSET_MS = value
@@ -2162,48 +1676,7 @@ class MainWindow(QMainWindow):
 
     def _queue_preview(self):
         """Debounced preview refresh — fires 60ms after sliders stop moving."""
-        self._preview_timer.start()
-
-    # ── Playback ──────────────────────────────────────────────────────────────
-
-    def _play_toggle(self):
-        if not self.video_row.path or self.video_dur <= 0:
-            return
-        if self._playing:
-            self._play_pause()
-        else:
-            self._play_start()
-
-    def _play_start(self):
-        self._playing = True
-        self.play_btn.setIcon(_icon("pause.png", 22))
-        self._play_timer.start()
-
-    def _play_pause(self):
-        self._playing = False
-        self.play_btn.setIcon(_icon("play.png", 22))
-        self._play_timer.stop()
-
-    def _play_restart(self):
-        self._play_pause()
-        self.frame_sl.setValue(0)
-        self._refresh_preview()
-
-    def _play_tick(self):
-        """Advance the preview slider by one timer tick (100ms worth of video)."""
-        if self.video_dur <= 0:
-            self._play_pause()
-            return
-        current = self.frame_sl.value()
-        # Each tick = 100ms of video → slider step = 100ms / duration * 100 (pct)
-        step = max(1, round(0.1 / self.video_dur * 100))
-        nxt  = current + step
-        if nxt >= 100:
-            self.frame_sl.setValue(100)
-            self._play_pause()   # reached end — stop
-        else:
-            self.frame_sl.setValue(nxt)
-            # _on_frame_sl fires automatically via valueChanged
+        self._player_panel.controller.queue_refresh()
 
     # ── Trim ─────────────────────────────────────────────────────────────────
 
@@ -2257,14 +1730,12 @@ class MainWindow(QMainWindow):
         self.trim_sel.reset()
 
     def _set_trim_in(self):
-        """Set In point to current frame slider position."""
-        pct = self.frame_sl.value() / 100.0
-        self.trim_sel.set_in(pct)
+        """Set In point to current timeline position."""
+        self._player_panel.controller.set_trim_in()
 
     def _set_trim_out(self):
-        """Set Out point to current frame slider position."""
-        pct = self.frame_sl.value() / 100.0
-        self.trim_sel.set_out(pct)
+        """Set Out point to current timeline position."""
+        self._player_panel.controller.set_trim_out()
 
     # ── Render ────────────────────────────────────────────────────────────────
 

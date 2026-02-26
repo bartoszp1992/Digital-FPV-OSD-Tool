@@ -21,7 +21,11 @@ HUD elements directly onto the footage — frame-accurate, GPU-accelerated.
 - SRT telemetry bar (speed, altitude, satellites, signal)
 - GPU-accelerated encoding (NVIDIA NVENC, AMD AMF, Intel QSV)
 - Trim, scale, offset, opacity controls
-- Live preview with scrubbing
+- Built-in video player with scrubbing, frame stepping and shuttle playback
+- PTS-based OSD sync (handles DVR videos with signal loss / packet drops)
+- Two-layer preview compositing (instant OSD/SRT slider response)
+- Keyboard shortcuts (play, scrub, trim, shuttle, step)
+- Custom font import (add your own OSD fonts)
 - Upscale to 1440p, 2.7K or 4K
 - Target bitrate encoding (auto-matched to source, 1–100 Mbit/s)
 - Light and dark theme with custom colour editor
@@ -59,6 +63,21 @@ brew install ffmpeg            # macOS
 
 ---
 
+## Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| Space | Play / Pause |
+| Left / Right | Step back / forward one frame |
+| Shift + Left / Right | Step back / forward 10 frames |
+| J | Step backward one frame |
+| K | Pause |
+| L | Play forward / increase speed |
+| I / O | Set trim in / out at current position |
+| Home / End | Jump to start / end |
+
+---
+
 ## Build Standalone Executable
 
 **Windows** — run `build.bat` after first launch (produces `dist\VueOSD.exe`)
@@ -84,13 +103,14 @@ python main.py
 
 ```
 main.py              Main application (PyQt6 GUI)
+player.py            Video player widgets (canvas, timeline, transport)
 video_processor.py   FFmpeg pipeline, GPU detection, encoding
 osd_renderer.py      Numpy-based OSD compositor (~1 ms/frame)
 osd_parser.py        .osd binary format parser
 p1_osd_parser.py     BetaFPV P1 embedded OSD extractor
 srt_parser.py        .srt telemetry parser
 font_loader.py       OSD font loader (multi-column HD fonts)
-fonts/               SneakyFPV OSD font packs
+fonts/               OSD font packs (Betaflight, INAV, ArduPilot)
 ```
 
 ---
