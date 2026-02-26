@@ -11,7 +11,7 @@ HUD elements directly onto the footage — frame-accurate, GPU-accelerated.
 
 ## Features
 
-- Frame-accurate OSD overlay (no sync drift)
+- Frame-accurate OSD overlay
 - Betaflight, INAV & ArduPilot font support (SneakyFPV HD fonts included)
 - Firmware auto-detected from OSD file header
 - BetaFPV P1 embedded OSD support
@@ -22,7 +22,6 @@ HUD elements directly onto the footage — frame-accurate, GPU-accelerated.
 - GPU-accelerated encoding (NVIDIA NVENC, AMD AMF, Intel QSV)
 - Trim, scale, offset, opacity controls
 - Built-in video player with scrubbing, frame stepping and shuttle playback
-- PTS-based OSD sync (handles DVR videos with signal loss / packet drops)
 - Two-layer preview compositing (instant OSD/SRT slider response)
 - Keyboard shortcuts (play, scrub, trim, shuttle, step)
 - Custom font import (add your own OSD fonts)
