@@ -74,6 +74,7 @@ class ProcessingConfig:
     upscale_target: str  = ""     # "" = no upscale | "1440p" | "2.7k" | "4k"
     osd_data:      object = None  # pre-parsed OsdFile (e.g. P1 embedded OSD)
     osd_offset_ms: int   = 0     # Manual OSD sync offset (ms); positive = OSD forward
+    srt_enabled_fields: Optional[set] = None  # SRT field keys to show; None = all
 
 
 # ── GPU encoder detection ─────────────────────────────────────────────────────
@@ -650,7 +651,7 @@ def _overlay_pipeline(
                 if srt_data and config.show_srt_bar:
                     td = srt_data.get_data_at_time(abs_t_ms)
                     if td:
-                        srt_text = td.status_line()
+                        srt_text = td.status_line(config.srt_enabled_fields)
 
                 cache_key = (osd_frame.index if osd_frame else -1, srt_text)
                 if cache_key not in _frame_cache:
@@ -762,7 +763,7 @@ def _srt_only_pipeline(
             srt_text = ""
             if srt_data and config.show_srt_bar:
                 td = srt_data.get_data_at_time(t_ms)
-                if td: srt_text = td.status_line()
+                if td: srt_text = td.status_line(config.srt_enabled_fields)
             if srt_text:
                 img = Image.frombuffer("RGBA", (width, height), raw, "raw", "RGBA", 0, 1)
                 out = img.copy()

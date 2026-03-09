@@ -24,6 +24,25 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+# ── Selectable SRT field registry ─────────────────────────────────────────────
+SRT_FIELDS: list[tuple[str, str]] = [
+    ("flight_time", "Flight Time"),
+    ("signal",      "Signal"),
+    ("channel",     "Channel"),
+    ("freq_mhz",    "Frequency"),
+    ("radio1",      "Radio 1"),
+    ("radio2",      "Radio 2"),
+    ("sbat_v",      "Sky Battery"),
+    ("gbat_v",      "Ground Battery"),
+    ("voltage_v",   "Voltage"),
+    ("delay_ms",    "Latency"),
+    ("link_mbps",   "Bitrate"),
+    ("altitude_m",  "Altitude"),
+    ("distance_m",  "Distance"),
+    ("sty_mode",    "STY Mode"),
+]
+ALL_SRT_FIELD_KEYS: set[str] = {k for k, _ in SRT_FIELDS}
+
 
 @dataclass
 class TelemetryData:
@@ -46,42 +65,52 @@ class TelemetryData:
     sbat_v:        Optional[float] = None
     gbat_v:        Optional[float] = None
     delay_ms:      Optional[int]   = None
+    sty_mode:      Optional[int]   = None
 
-    def status_line(self) -> str:
-        """Build a compact one-line status string for the bottom overlay bar."""
+    def status_line(self, enabled: "set[str] | None" = None) -> str:
+        """Build a compact one-line status string for the bottom overlay bar.
+
+        *enabled* — set of field keys to include (see ``SRT_FIELDS``).
+        ``None`` means show all fields (backward compatible).
+        """
+        def _on(key: str) -> bool:
+            return enabled is None or key in enabled
+
         parts = []
-        if self.flight_time:
+        if self.flight_time and _on("flight_time"):
             parts.append(self.flight_time)
-        if self.signal is not None:
+        if self.signal is not None and _on("signal"):
             parts.append(f"Sig:{self.signal}")
-        if self.channel is not None:
+        if self.channel is not None and _on("channel"):
             parts.append(f"CH:{self.channel}")
-        if self.freq_mhz is not None:
+        if self.freq_mhz is not None and _on("freq_mhz"):
             parts.append(f"{self.freq_mhz:.0f}MHz")
-        if self.radio1_dbm is not None:
+        if self.radio1_dbm is not None and _on("radio1"):
             s = f"R1:{self.radio1_dbm:+d}dBm"
             if self.radio1_snr is not None:
                 s += f" {self.radio1_snr}SNR"
             parts.append(s)
-        if self.radio2_dbm is not None:
+        if self.radio2_dbm is not None and _on("radio2"):
             s = f"R2:{self.radio2_dbm:+d}dBm"
             if self.radio2_snr is not None:
                 s += f" {self.radio2_snr}SNR"
             parts.append(s)
-        if self.sbat_v is not None:
+        if self.sbat_v is not None and _on("sbat_v"):
             parts.append(f"SBat:{self.sbat_v:.1f}V")
-        if self.gbat_v is not None:
+        if self.gbat_v is not None and _on("gbat_v"):
             parts.append(f"GBat:{self.gbat_v:.1f}V")
-        if self.voltage_v is not None:
+        if self.voltage_v is not None and _on("voltage_v"):
             parts.append(f"{self.voltage_v:.1f}V")
-        if self.delay_ms is not None:
+        if self.delay_ms is not None and _on("delay_ms"):
             parts.append(f"Latency:{self.delay_ms}ms")
-        if self.link_mbps is not None:
+        if self.link_mbps is not None and _on("link_mbps"):
             parts.append(f"{self.link_mbps:.1f}Mbps")
-        if self.altitude_m is not None:
+        if self.altitude_m is not None and _on("altitude_m"):
             parts.append(f"H:{self.altitude_m:.0f}m")
-        if self.distance_m is not None:
+        if self.distance_m is not None and _on("distance_m"):
             parts.append(f"Dist:{self.distance_m:.0f}m")
+        if self.sty_mode is not None and _on("sty_mode"):
+            parts.append(f"STY:{self.sty_mode}")
         return "  ".join(parts)
 
 
@@ -125,13 +154,14 @@ _ALT_RE         = re.compile(r"H:\s*([\d.]+)\s*(m|ft)", re.IGNORECASE)
 _VOLT_RE        = re.compile(r"([\d.]+)\s*V\b")
 _GPS_RE         = re.compile(r"(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)")
 # Walksnail/Avatar fields
-_SIGNAL_RE      = re.compile(r"Signal:(\d+)", re.IGNORECASE)
-_CHANNEL_RE     = re.compile(r"\bCH:(\d+)", re.IGNORECASE)
-_HZ_RE          = re.compile(r"\bHz:(\d+)", re.IGNORECASE)
-_FLIGHTTIME_RE  = re.compile(r"FlightTime:(\d+)", re.IGNORECASE)
-_SBAT_RE        = re.compile(r"SBat:([\d.]+)\s*V", re.IGNORECASE)
-_GBAT_RE        = re.compile(r"GBat:([\d.]+)\s*V", re.IGNORECASE)
-_DELAY_RE       = re.compile(r"Delay:(\d+)\s*ms", re.IGNORECASE)
+_SIGNAL_RE      = re.compile(r"Signal:\s*(\d+)", re.IGNORECASE)
+_CHANNEL_RE     = re.compile(r"\bCH:\s*(\d+)", re.IGNORECASE)
+_HZ_RE          = re.compile(r"\bHz:\s*(\d+)", re.IGNORECASE)
+_FLIGHTTIME_RE  = re.compile(r"FlightTime:\s*(\d+)", re.IGNORECASE)
+_SBAT_RE        = re.compile(r"SBat:\s*([\d.]+)\s*V?", re.IGNORECASE)
+_GBAT_RE        = re.compile(r"GBat:\s*([\d.]+)\s*V?", re.IGNORECASE)
+_DELAY_RE       = re.compile(r"Delay:\s*(\d+)\s*ms", re.IGNORECASE)
+_STYMODE_RE     = re.compile(r"STYMode:\s*(\d+)", re.IGNORECASE)
 
 
 def _ft_to_m(ft: float) -> float:
@@ -183,6 +213,11 @@ def _parse_lines(lines: list[str]) -> TelemetryData:
         dly = _DELAY_RE.search(line)
         if dly:
             t.delay_ms = int(dly.group(1))
+
+        # STY mode (BetaFPV P1)
+        sty = _STYMODE_RE.search(line)
+        if sty:
+            t.sty_mode = int(sty.group(1))
 
         # Radio interfaces
         for m in _RADIO_RE.finditer(line):

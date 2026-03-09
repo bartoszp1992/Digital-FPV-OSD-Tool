@@ -26,10 +26,11 @@ from PyQt6.QtWidgets import (
     QDialog, QLineEdit,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QUrl
-from PyQt6.QtGui import QFont, QPixmap, QImage, QPainter, QColor, QPen, QIcon, QDesktopServices
+from PyQt6.QtGui import (QFont, QPixmap, QImage, QPainter, QColor, QPen, QIcon,
+                         QDesktopServices, QStandardItem, QStandardItemModel)
 
 
-from srt_parser    import parse_srt, SrtFile
+from srt_parser    import parse_srt, SrtFile, SRT_FIELDS
 from osd_parser    import parse_osd, OsdFile, GRID_COLS, GRID_ROWS
 from p1_osd_parser import detect_p1, parse_p1_osd, p1_to_osd_file
 from font_loader   import (fonts_by_firmware, load_font, load_font_from_file,
@@ -56,7 +57,7 @@ _DARK_THEME = True   # module-level flag; toggled by the theme button
 
 # ─── Version & UI scale ───────────────────────────────────────────────────────
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 _UI_SCALE = 1.0
 _SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
@@ -448,6 +449,70 @@ class LabeledSlider(QWidget):
         self.vl.setStyleSheet(f"color:{_T()['text']};font-size:11px;font-weight:bold;")
 
 
+class CheckableComboBox(QComboBox):
+    """Multi-select combo box with checkable items."""
+    selectionChanged = pyqtSignal(set)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        self.view().viewport().installEventFilter(self)
+        self._keys: list[str] = []
+
+    def add_items(self, items: list[tuple[str, str]]):
+        """Add (key, label) pairs as checkable items, all checked by default."""
+        self._keys.clear()
+        self._model.clear()
+        for key, label in items:
+            item = QStandardItem(label)
+            item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            item.setData(Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
+            item.setData(key, Qt.ItemDataRole.UserRole)
+            self._model.appendRow(item)
+            self._keys.append(key)
+
+    def checked_keys(self) -> set[str]:
+        """Return set of keys for currently checked items."""
+        result = set()
+        for i in range(self._model.rowCount()):
+            item = self._model.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                result.add(item.data(Qt.ItemDataRole.UserRole))
+        return result
+
+    def eventFilter(self, obj, event):
+        """Keep popup open when clicking items."""
+        if obj is self.view().viewport() and event.type() == event.Type.MouseButtonRelease:
+            idx = self.view().indexAt(event.pos())
+            if idx.isValid():
+                item = self._model.itemFromIndex(idx)
+                new_state = (Qt.CheckState.Unchecked
+                             if item.checkState() == Qt.CheckState.Checked
+                             else Qt.CheckState.Checked)
+                item.setCheckState(new_state)
+                self.selectionChanged.emit(self.checked_keys())
+                return True
+        return super().eventFilter(obj, event)
+
+    def paintEvent(self, event):
+        """Show summary text instead of single selected item."""
+        from PyQt6.QtWidgets import QStylePainter, QStyleOptionComboBox, QStyle
+        painter = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        total = self._model.rowCount()
+        checked = len(self.checked_keys())
+        if checked == 0:
+            opt.currentText = "No fields"
+        elif checked == total:
+            opt.currentText = "All fields"
+        else:
+            opt.currentText = f"{checked} / {total} fields"
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt)
+        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt)
+
+
 class InfoCard(QGroupBox):
     def __init__(self, title, parent=None):
         super().__init__(title, parent)
@@ -798,6 +863,13 @@ class MainWindow(QMainWindow):
         self.srt_size_sl = LabeledSlider("Size", 75, 200, 100, "%")
         self.srt_size_sl.valueChanged.connect(self._refresh_preview)
 
+        _fields_lbl = QLabel("Visible fields:")
+        _fields_lbl.setStyleSheet(f"color:{_T()['subtext']};font-size:11px;")
+        self.srt_fields_combo = CheckableComboBox()
+        self.srt_fields_combo.add_items(SRT_FIELDS)
+        self.srt_fields_combo.setStyleSheet(f"font-size:11px;")
+        self.srt_fields_combo.selectionChanged.connect(lambda _: self._refresh_preview())
+
         note2 = QLabel("Radio signal, bitrate, GPS, altitude from .srt.\n"
                        "'No MAVLink telemetry' lines are hidden.")
         note2.setStyleSheet(f"color:{_T()['muted']};font-size:10px;")
@@ -806,6 +878,8 @@ class MainWindow(QMainWindow):
         srtgl.addWidget(self.srt_bar_check)
         srtgl.addWidget(self.srt_opacity_sl)
         srtgl.addWidget(self.srt_size_sl)
+        srtgl.addWidget(_fields_lbl)
+        srtgl.addWidget(self.srt_fields_combo)
         srtgl.addWidget(note2)
         ll.addWidget(srtg)
 
@@ -1619,7 +1693,7 @@ class MainWindow(QMainWindow):
         srt_text = ""
         if self.srt_data and self.srt_bar_check.isChecked():
             td = self.srt_data.get_data_at_time(t_ms)
-            if td: srt_text = td.status_line()
+            if td: srt_text = td.status_line(self.srt_fields_combo.checked_keys())
         cfg = OsdRenderConfig(
             offset_x     = self.sl_x.value(),
             offset_y     = self.sl_y.value(),
@@ -1644,7 +1718,7 @@ class MainWindow(QMainWindow):
         srt_text = ""
         if self.srt_data and self.srt_bar_check.isChecked():
             td = self.srt_data.get_data_at_time(t_ms)
-            if td: srt_text = td.status_line()
+            if td: srt_text = td.status_line(self.srt_fields_combo.checked_keys())
         # Scale pixel offsets from video resolution to display resolution
         ctrl = self._player_panel.controller
         ratio = h / ctrl.video_h if ctrl.video_h > 0 else 1.0
@@ -1946,6 +2020,7 @@ class MainWindow(QMainWindow):
             trim_end      = self.trim_sel.out_pct * self.video_dur,
             upscale_target = upscale_target,
             osd_offset_ms = self.osd_offset_sb.value(),
+            srt_enabled_fields = self.srt_fields_combo.checked_keys(),
         )
 
         self.render_btn.setEnabled(False)
