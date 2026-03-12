@@ -2087,29 +2087,27 @@ class MainWindow(QMainWindow):
             return
         data = self._cc_presets[name]
         self._cc_loading_preset = True
-        try:
-            self.cc_reverse.setChecked(data.get("reverse_enabled", True))
-            self.cc_yoff.setValue(int(data.get("yoff_strength", 0.25) * 100))
-            self.cc_blift.setValue(int(data.get("black_lift", 0.02) * 1000))
-            self.cc_brightness.setValue(int(data.get("brightness", 0.0) * 100))
-            self.cc_contrast.setValue(int(data.get("contrast", 1.0) * 100))
-            self.cc_gamma.setValue(int(data.get("gamma", 1.0) * 100))
-            self.cc_lift.setValue(int(data.get("lift", -0.15) * 100))
-            self.cc_gain.setValue(int(data.get("gain", 1.75) * 100))
-            self.cc_hue.setValue(int(data.get("hue", 0.0)))
-            self.cc_sat.setValue(int(data.get("saturation", -22.5)))
-            self.cc_r.setValue(int(data.get("r_mult", 1.0) * 100))
-            self.cc_g.setValue(int(data.get("g_mult", 1.0) * 100))
-            self.cc_b.setValue(int(data.get("b_mult", 1.0) * 100))
-            glsl = data.get("glsl_shader", "")
-            if glsl and os.path.isfile(glsl):
-                self.cc_glsl_row.set_path(glsl)
-            else:
-                self.cc_glsl_row.set_path("")
-        finally:
-            self._cc_loading_preset = False
-        # Update RGB label and trigger preview
+        self.cc_reverse.setChecked(data.get("reverse_enabled", True))
+        self.cc_yoff.setValue(int(data.get("yoff_strength", 0.25) * 100))
+        self.cc_blift.setValue(int(data.get("black_lift", 0.02) * 1000))
+        self.cc_brightness.setValue(int(data.get("brightness", 0.0) * 100))
+        self.cc_contrast.setValue(int(data.get("contrast", 1.0) * 100))
+        self.cc_gamma.setValue(int(data.get("gamma", 1.0) * 100))
+        self.cc_lift.setValue(int(data.get("lift", -0.15) * 100))
+        self.cc_gain.setValue(int(data.get("gain", 1.75) * 100))
+        self.cc_hue.setValue(int(data.get("hue", 0.0)))
+        self.cc_sat.setValue(int(data.get("saturation", -22.5)))
+        self.cc_r.setValue(int(data.get("r_mult", 1.0) * 100))
+        self.cc_g.setValue(int(data.get("g_mult", 1.0) * 100))
+        self.cc_b.setValue(int(data.get("b_mult", 1.0) * 100))
+        glsl = data.get("glsl_shader", "")
+        if glsl and os.path.isfile(glsl):
+            self.cc_glsl_row.set_path(glsl)
+        else:
+            self.cc_glsl_row.set_path("")
+        # Update RGB label and trigger preview (keep flag true so preset name sticks)
         self._on_color_changed()
+        self._cc_loading_preset = False
 
     def _cc_save_preset(self):
         name, ok = QFileDialog.getSaveFileName(
@@ -2146,33 +2144,31 @@ class MainWindow(QMainWindow):
             self._st(f"Failed to save preset: {e}")
 
     def _cc_reset_defaults(self):
-        """Reset all color correction sliders to OpenIPC defaults."""
+        """Reset all color correction sliders to Reverse ColorTrans defaults."""
         self._cc_loading_preset = True
-        try:
-            self.cc_reverse.setChecked(True)
-            self.cc_yoff.setValue(25)
-            self.cc_blift.setValue(20)
-            self.cc_brightness.setValue(0)
-            self.cc_contrast.setValue(100)
-            self.cc_gamma.setValue(100)
-            self.cc_lift.setValue(-15)
-            self.cc_gain.setValue(175)
-            self.cc_hue.setValue(0)
-            self.cc_sat.setValue(-22)
-            self.cc_r.setValue(100)
-            self.cc_g.setValue(100)
-            self.cc_b.setValue(100)
-            self.cc_glsl_row.set_path("")
-            self._cc_glsl_warn.setVisible(False)
-        finally:
-            self._cc_loading_preset = False
-        # Select OpenIPC Default preset if it exists
-        idx = self.cc_preset_cb.findText("OpenIPC Default")
+        self.cc_reverse.setChecked(True)
+        self.cc_yoff.setValue(25)
+        self.cc_blift.setValue(20)
+        self.cc_brightness.setValue(0)
+        self.cc_contrast.setValue(100)
+        self.cc_gamma.setValue(100)
+        self.cc_lift.setValue(-15)
+        self.cc_gain.setValue(175)
+        self.cc_hue.setValue(0)
+        self.cc_sat.setValue(-22)
+        self.cc_r.setValue(100)
+        self.cc_g.setValue(100)
+        self.cc_b.setValue(100)
+        self.cc_glsl_row.set_path("")
+        self._cc_glsl_warn.setVisible(False)
+        # Select Reverse ColorTrans preset if it exists
+        idx = self.cc_preset_cb.findText("Reverse ColorTrans")
         if idx >= 0:
             self.cc_preset_cb.blockSignals(True)
             self.cc_preset_cb.setCurrentIndex(idx)
             self.cc_preset_cb.blockSignals(False)
         self._on_color_changed()
+        self._cc_loading_preset = False
 
     def _cc_save_to_settings(self):
         """Persist current color correction state to settings.json."""

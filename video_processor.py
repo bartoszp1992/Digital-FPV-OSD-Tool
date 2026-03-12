@@ -100,7 +100,12 @@ def generate_colortrans_lut(cc: ColorTransConfig, path: str) -> str:
     global _lut_cache_hash, _lut_cache_path
     h = _colortrans_hash(cc)
     if h == _lut_cache_hash and _lut_cache_path and os.path.exists(_lut_cache_path):
-        return _lut_cache_path
+        # If the caller wants the file at a different path, copy it there
+        if os.path.normpath(_lut_cache_path) != os.path.normpath(path):
+            import shutil
+            os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+            shutil.copy2(_lut_cache_path, path)
+        return path
 
     N = 33
     lin = np.linspace(0.0, 1.0, N, dtype=np.float32)
