@@ -2519,9 +2519,15 @@ class MainWindow(QMainWindow):
         _upscale_map = {0: "", 1: "1440p", 2: "2.7k", 3: "4k"}
         upscale_target = _upscale_map.get(self.upscale_combo.currentIndex(), "")
 
+        # Force .mov extension for transparent export (ProRes 4444 needs MOV container)
+        _out_path = self.out_row.path
+        if self.transparent_check.isChecked() and not _out_path.lower().endswith(".mov"):
+            _out_path = str(Path(_out_path).with_suffix(".mov"))
+            self.out_row.set_path(_out_path)
+
         cfg = ProcessingConfig(
             input_video   = self.video_row.path,
-            output_video  = self.out_row.path,
+            output_video  = _out_path,
             osd_file      = self.osd_row.path or None,
             osd_data      = self.osd_data,        # pass in-memory OSD (covers P1 embedded)
             srt_file      = self.srt_row.path or None,

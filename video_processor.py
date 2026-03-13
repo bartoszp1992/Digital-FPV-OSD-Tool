@@ -925,6 +925,12 @@ def _transparent_pipeline(
     Render OSD+SRT frames with transparency → ProRes 4444 .mov (no source video composited).
     Source video is still needed for dimensions, fps, duration, and PTS timestamps.
     """
+    # ProRes 4444 requires MOV container — force extension
+    out_path = config.output_video
+    if not out_path.lower().endswith(".mov"):
+        out_path = os.path.splitext(out_path)[0] + ".mov"
+        config.output_video = out_path
+
     enc_label = "ProRes 4444"
 
     render_cfg = OsdRenderConfig(
