@@ -1300,6 +1300,20 @@ class MainWindow(QMainWindow):
         upscale_row.addWidget(self.upscale_combo, 1)
         encgl.addLayout(upscale_row)
 
+        encgl.addWidget(_sep())
+
+        # Transparent overlay export
+        self.transparent_check = QCheckBox("Transparent overlay (ProRes 4444)")
+        self.transparent_check.setStyleSheet(f"color:{_T()['text']};font-size:11px;")
+        self.transparent_check.setToolTip(
+            "Export only the OSD glyphs and SRT bar as a video with\n"
+            "a transparent background (ProRes 4444 alpha, .mov).\n\n"
+            "Layer it on GoPro/action-cam footage in DaVinci Resolve,\n"
+            "Premiere Pro, or Final Cut Pro."
+        )
+        self.transparent_check.stateChanged.connect(self._on_transparent_changed)
+        encgl.addWidget(self.transparent_check)
+
         rl.addWidget(encg)
         rl.addStretch()
         right_scroll.setWidget(right)
@@ -1361,6 +1375,33 @@ class MainWindow(QMainWindow):
 
     def _on_codec_changed(self):
         self._update_size_hint()
+
+    def _on_transparent_changed(self, state):
+        """Toggle encoding controls when transparent overlay mode changes."""
+        checked = bool(state)
+        # Disable controls irrelevant to transparent export
+        self.codec_cb.setEnabled(not checked)
+        self._codec_lbl.setEnabled(not checked)
+        self.mbps_row.setEnabled(not checked)
+        self.mbps_sl.setEnabled(not checked)
+        self.mbps_spin.setEnabled(not checked)
+        self._mbps_lbl.setEnabled(not checked)
+        self.size_hint.setVisible(not checked)
+        self.hw_check.setEnabled(not checked and self.hw_check.toolTip().startswith("✓"))
+        self.upscale_combo.setEnabled(not checked)
+        self._upscale_lbl.setEnabled(not checked)
+        if hasattr(self, 'cc_enable'):
+            self.cc_enable.setEnabled(not checked)
+            if checked:
+                self._cc_content.setVisible(False)
+            else:
+                self._cc_content.setVisible(self.cc_enable.isChecked())
+        # Update output path extension when toggling
+        if self.video_row.path:
+            trim_s = self.trim_sel.in_pct  * self.video_dur if self.video_dur > 0 else 0.0
+            trim_e = self.trim_sel.out_pct * self.video_dur if self.video_dur > 0 else 0.0
+            self.out_row.set_path(
+                self._make_output_path(self.video_row.path, trim_s, trim_e))
 
     @staticmethod
     def _mbps_to_slider(mbps):
@@ -2244,10 +2285,10 @@ class MainWindow(QMainWindow):
     def _clean_stem(stem: str) -> str:
         """Strip any existing _osd or _osd_<timestamps> suffix from a stem."""
         import re
-        # Remove _osd_NNNN-NNNN timestamp suffix variants
-        stem = re.sub(r'_osd_\d+[-_]\d+$', '', stem)
-        # Remove bare _osd suffix
-        stem = re.sub(r'_osd$', '', stem)
+        # Remove _osd_NNNN-NNNN or _overlay_NNNN-NNNN timestamp suffix variants
+        stem = re.sub(r'_(?:osd|overlay)_\d+[-_]\d+$', '', stem)
+        # Remove bare _osd or _overlay suffix
+        stem = re.sub(r'_(?:osd|overlay)$', '', stem)
         return stem
 
     def _make_output_path(self, video_path: str, trim_start_s: float = 0.0,
@@ -2273,7 +2314,10 @@ class MainWindow(QMainWindow):
         else:
             ts = ""
 
-        out_name = f"{stem}_osd{ts}.mp4"
+        if hasattr(self, 'transparent_check') and self.transparent_check.isChecked():
+            out_name = f"{stem}_overlay{ts}.mov"
+        else:
+            out_name = f"{stem}_osd{ts}.mp4"
         return str(p.parent / out_name)
 
     def _trim_reset(self):
@@ -2444,8 +2488,9 @@ class MainWindow(QMainWindow):
             def _sa():
                 new_name = name_edit.text().strip()
                 if not new_name: return
-                if not new_name.lower().endswith(".mp4"):
-                    new_name += ".mp4"
+                _req_ext = ".mov" if self.transparent_check.isChecked() else ".mp4"
+                if not new_name.lower().endswith(_req_ext):
+                    new_name += _req_ext
                 new_path = os.path.join(os.path.dirname(out_path), new_name)
                 if os.path.exists(new_path) and new_path != out_path:
                     name_edit.setStyleSheet(
@@ -2497,7 +2542,8 @@ class MainWindow(QMainWindow):
             upscale_target = upscale_target,
             osd_offset_ms = self.osd_offset_sb.value(),
             srt_enabled_fields = self.srt_fields_combo.checked_keys(),
-            color_config = self._get_color_config() if self.cc_enable.isChecked() else None,
+            color_config = self._get_color_config() if self.cc_enable.isChecked() and not self.transparent_check.isChecked() else None,
+            transparent_export = self.transparent_check.isChecked(),
         )
 
         self.render_btn.setEnabled(False)

@@ -259,6 +259,7 @@ class ProcessingConfig:
     osd_offset_ms: int   = 0     # Manual OSD sync offset (ms); positive = OSD forward
     srt_enabled_fields: Optional[set] = None  # SRT field keys to show; None = all
     color_config: Optional[ColorTransConfig] = None  # Color correction settings
+    transparent_export: bool = False  # Export OSD-only with alpha (ProRes 4444 .mov)
 
 
 # ── GPU encoder detection ─────────────────────────────────────────────────────
@@ -650,6 +651,15 @@ def process_video(
     quality_args, preset_args, pix_fmt_args = _build_quality_args(encoder, config, use_vaapi)
 
     # ── Choose pipeline ────────────────────────────────────────────────────────
+
+    # Transparent overlay export: OSD frames → ProRes 4444 with alpha, no source video decode
+    if config.transparent_export:
+        if osd_data is None and srt_data is None:
+            raise RuntimeError("Transparent export requires OSD data or SRT data — nothing to render.")
+        return _transparent_pipeline(
+            ffmpeg, config, osd_data, srt_data, font,
+            width, height, fps, duration, progress_callback)
+
     # Fast path: OSD overlay pipe — Python handles ONLY the OSD frames,
     # FFmpeg handles all video frame I/O natively in C.
     if font and osd_data:
@@ -898,6 +908,141 @@ def _overlay_pipeline(
                     f"GPU encode failed ({hw_info['name']}):\n{err[-800:]}\n\n"
                     "Try disabling GPU acceleration in Settings.")
         raise RuntimeError(f"Encode failed (exit {ffmpeg_proc.returncode}):\n{err[-2000:]}")
+
+    if progress_callback:
+        progress_callback(100, f"✓ Done  [{enc_label}]")
+
+    return osd_trimmed_warning or True
+
+
+# ── Transparent overlay export (ProRes 4444 with alpha) ────────────────────────
+
+def _transparent_pipeline(
+    ffmpeg, config, osd_data, srt_data, font,
+    width, height, fps, duration, progress_callback,
+):
+    """
+    Render OSD+SRT frames with transparency → ProRes 4444 .mov (no source video composited).
+    Source video is still needed for dimensions, fps, duration, and PTS timestamps.
+    """
+    enc_label = "ProRes 4444"
+
+    render_cfg = OsdRenderConfig(
+        offset_x    = config.offset_x,
+        offset_y    = config.offset_y,
+        scale       = config.scale,
+        show_srt_bar= config.show_srt_bar,
+        srt_opacity = config.srt_opacity,
+        srt_scale   = config.srt_scale,
+    )
+    renderer = OsdRenderer(width, height, font, render_cfg)
+
+    # Trim window
+    _t_start = config.trim_start if config.trim_start > 0.01 else 0.0
+    _t_end   = config.trim_end   if config.trim_end   > 0.01 else duration
+    _t_dur   = max(0.001, _t_end - _t_start)
+
+    n_out_frames = max(1, int(_t_dur * fps))
+
+    # OSD availability check
+    osd_in_window = []
+    if osd_data:
+        t_start_ms = int(_t_start * 1000)
+        t_end_ms   = int(_t_end   * 1000)
+        osd_in_window = [fr for fr in osd_data.frames
+                         if t_start_ms <= fr.time_ms <= t_end_ms + 500]
+
+    osd_trimmed_warning = ""
+    if osd_data and not osd_in_window:
+        osd_trimmed_warning = "No OSD elements in trim window — rendered without OSD overlay"
+        if progress_callback:
+            progress_callback(0, f"⚠ {osd_trimmed_warning}")
+
+    if progress_callback:
+        progress_callback(5, f"{width}×{height} @ {fps}fps · {n_out_frames} frames · {enc_label}")
+
+    # PTS extraction for frame-accurate sync
+    pts_list = get_frame_pts(config.input_video, _t_start)
+    use_pts  = len(pts_list) >= n_out_frames
+
+    # FFmpeg command: rawvideo RGBA input → ProRes 4444 with alpha
+    ffmpeg_cmd = [
+        ffmpeg, "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgba",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", "prores_ks",
+        "-profile:v", "4444",
+        "-pix_fmt", "yuva444p10le",
+        "-vendor", "apl0",
+        "-movflags", "+faststart",
+        "-an",
+        config.output_video,
+    ]
+
+    ffmpeg_proc = _hidden_popen(
+        ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+
+    ffmpeg_stderr = [""]
+    threading.Thread(target=_drain, args=(ffmpeg_proc.stderr, ffmpeg_stderr),
+                     daemon=True).start()
+
+    # Render loop — same logic as _overlay_pipeline
+    _frame_cache: dict = {}
+    report_every = max(1, n_out_frames // 50)
+
+    try:
+        if osd_data and not osd_in_window and not srt_data:
+            # Nothing to render — single blank frame
+            ffmpeg_proc.stdin.write(bytes(renderer.composite(None, "")))
+        else:
+            for i in range(n_out_frames):
+                t_sec    = pts_list[i] if use_pts else i / fps
+                abs_t_ms = int((_t_start + t_sec) * 1000 + config.osd_offset_ms)
+
+                osd_frame = None
+                if osd_data and osd_in_window:
+                    osd_frame = osd_data.frame_at_time(abs_t_ms)
+
+                srt_text = ""
+                if srt_data and config.show_srt_bar:
+                    td = srt_data.get_data_at_time(abs_t_ms)
+                    if td:
+                        srt_text = td.status_line(config.srt_enabled_fields)
+
+                cache_key = (osd_frame.index if osd_frame else -1, srt_text)
+                if cache_key not in _frame_cache:
+                    if len(_frame_cache) >= _CACHE_MAX:
+                        del _frame_cache[next(iter(_frame_cache))]
+                    _frame_cache[cache_key] = bytes(
+                        renderer.composite(osd_frame, srt_text))
+
+                ffmpeg_proc.stdin.write(_frame_cache[cache_key])
+
+                if progress_callback and (i % report_every == 0 or i == n_out_frames - 1):
+                    pct = min(5 + int(i / n_out_frames * 85), 90)
+                    progress_callback(pct,
+                        f"Frame {i+1}/{n_out_frames}  ({abs_t_ms/1000:.1f}s)  [{enc_label}]")
+
+    except (BrokenPipeError, OSError) as exc:
+        import errno as _errno
+        if not isinstance(exc, BrokenPipeError) and getattr(exc, 'errno', None) != _errno.EINVAL:
+            raise
+    finally:
+        try:
+            ffmpeg_proc.stdin.close()
+        except Exception:
+            pass
+
+    if progress_callback:
+        progress_callback(92, f"Encoding…  [{enc_label}]")
+
+    ffmpeg_proc.wait()
+
+    if ffmpeg_proc.returncode not in (0, None):
+        err = ffmpeg_stderr[0]
+        raise RuntimeError(f"ProRes encode failed (exit {ffmpeg_proc.returncode}):\n{err[-2000:]}")
 
     if progress_callback:
         progress_callback(100, f"✓ Done  [{enc_label}]")
